@@ -1,0 +1,129 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Shipment where
+
+import DA.Time (Time)
+import DA.Optional (isSome, fromSome, Optional)
+import Asset (Asset)
+
+-- | Defines the possible states of a shipment throughout its lifecycle.
+data ShipmentStatus
+  = PendingPickup         -- ^ Initial state. Shipment is ready for collection by the carrier.
+  | InTransit             -- ^ Shipment has been collected and is on its way.
+  | PendingCustomsClearance -- ^ Shipment is held for customs inspection.
+  | AwaitingDelivery      -- ^ Shipment has cleared customs (if applicable) and is ready for final delivery.
+  | Completed             -- ^ Shipment has been successfully delivered to the receiver.
+  deriving (Eq, Show, Ord)
+
+-- | Represents a shipment of assets from a sender to a receiver via a carrier.
+-- This contract orchestrates the transfer of custody for a batch of assets,
+-- providing an auditable trail of the shipment's progress.
+template Shipment
+  with
+    shipmentId      : Text                 -- ^ A unique identifier for the shipment.
+    description     : Text                 -- ^ A description of the contents of the shipment.
+    sender          : Party                -- ^ The party initiating the shipment (e.g., manufacturer).
+    carrier         : Party                -- ^ The logistics provider responsible for transport.
+    receiver        : Party                -- ^ The final recipient of the shipment (e.g., retailer).
+    customsAgency   : Optional Party       -- ^ An optional party for customs clearance.
+    assets          : [ContractId Asset]   -- ^ A list of asset contracts included in this shipment.
+    status          : ShipmentStatus       -- ^ The current status of the shipment.
+    lastUpdated     : Time                 -- ^ Timestamp of the last status update.
+    lastKnownLocation : Optional Text      -- ^ The last reported geographical location of the shipment.
+  where
+    signatory sender, carrier, receiver
+    observer case customsAgency of Some agency -> [agency]; None -> []
+
+    key (sender, shipmentId) : (Party, Text)
+    maintainer key._1
+
+    -- | The carrier confirms pickup of the shipment from the sender.
+    -- This action transfers the custody of all associated assets from the sender to the carrier.
+    choice Pickup : ContractId Shipment
+      with
+        pickupTime : Time
+        location   : Text
+      controller sender, carrier
+      do
+        assertMsg "Shipment must be in 'PendingPickup' status to be picked up."
+          (status == PendingPickup)
+
+        -- Atomically transfer custody of each asset to the carrier.
+        newAssetCids <- forA assets (\assetCid ->
+          exercise assetCid Asset.Transfer with newCustodian = carrier
+          )
+
+        create this with
+          assets = newAssetCids
+          status = InTransit
+          lastUpdated = pickupTime
+          lastKnownLocation = Some location
+
+    -- | The carrier marks the shipment as requiring customs clearance.
+    -- This is only possible if a customs agency was specified for the shipment.
+    choice MarkForCustoms : ContractId Shipment
+      with
+        updateTime: Time
+      controller carrier
+      do
+        assertMsg "A customs agency must be specified for this shipment to mark it for customs."
+          (isSome customsAgency)
+        assertMsg "Shipment must be in 'InTransit' status to be marked for customs."
+          (status == InTransit)
+
+        create this with
+          status = PendingCustomsClearance
+          lastUpdated = updateTime
+
+    -- | The designated customs agency clears the shipment for further transit.
+    choice ClearCustoms : ContractId Shipment
+      with
+        clearanceTime: Time
+      controller fromSome customsAgency
+      do
+        assertMsg "Shipment must be in 'PendingCustomsClearance' status to be cleared."
+          (status == PendingCustomsClearance)
+
+        create this with
+          status = AwaitingDelivery
+          lastUpdated = clearanceTime
+
+    -- | The carrier updates the last known location of the shipment.
+    -- This provides real-time tracking information to stakeholders.
+    choice UpdateLocation : ContractId Shipment
+      with
+        updateTime : Time
+        newLocation: Text
+      controller carrier
+      do
+        assertMsg "Cannot update location of a completed or pending pickup shipment."
+          (status `elem` [InTransit, AwaitingDelivery, PendingCustomsClearance])
+
+        create this with
+          lastUpdated = updateTime
+          lastKnownLocation = Some newLocation
+
+    -- | The receiver confirms successful delivery of the shipment.
+    -- This action transfers custody of all associated assets from the carrier to the receiver
+    -- and marks the shipment lifecycle as complete.
+    choice ConfirmDelivery : ContractId Shipment
+      with
+        deliveryTime : Time
+      controller carrier, receiver
+      do
+        assertMsg "Shipment must be in a deliverable state (InTransit, AwaitingDelivery, or PendingCustomsClearance)."
+          (status `elem` [InTransit, AwaitingDelivery, PendingCustomsClearance])
+
+        -- Atomically transfer custody of each asset to the receiver.
+        -- This ensures Delivery vs. Possession.
+        forA_ assets (\assetCid ->
+            exercise assetCid Asset.Transfer with newCustodian = receiver
+          )
+
+        -- The shipment is now complete. The link to the assets is cleared as
+        -- their custody has been transferred and they are no longer part of this shipment.
+        create this with
+          status = Completed
+          assets = []
+          lastUpdated = deliveryTime
