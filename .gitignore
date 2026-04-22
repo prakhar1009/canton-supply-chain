@@ -1,0 +1,32 @@
+.daml/
+.dpm/
+daml.log
+dist/
+target/
+*.dar
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Editor-specific
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# UI build output
+build/
+out/
