@@ -1,0 +1,110 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Checkpoint where
+
+import DA.Time (Time)
+import Shipment (Shipment)
+
+-- | Represents a pending checkpoint, quality gate, or customs inspection that a shipment
+-- must clear. This contract is created by the authority overseeing the checkpoint and
+-- observed by the current custodian of the shipment.
+template Checkpoint
+  with
+    authority   : Party
+      -- ^ The party responsible for clearing the checkpoint (e.g., customs, quality control).
+    custodian   : Party
+      -- ^ The party currently in custody of the shipment.
+    shipmentCid : ContractId Shipment
+      -- ^ The shipment contract this checkpoint pertains to.
+    checkpointId: Text
+      -- ^ A unique identifier for this type of checkpoint (e.g., "CUSTOMS_CLEARANCE_LAX").
+    description : Text
+      -- ^ A human-readable description of the checkpoint's purpose.
+  where
+    signatory authority
+    observer custodian
+
+    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
+    maintainer key._1
+
+    -- | The authority confirms the shipment has successfully passed the checkpoint.
+    -- This action archives the pending `Checkpoint` and creates a `CheckpointPassed`
+    -- contract as a permanent record of the event.
+    choice Pass : ContractId CheckpointPassed
+      controller authority
+      do
+        timestamp <- getTime
+        create CheckpointPassed with
+          authority
+          custodian
+          shipmentCid
+          checkpointId
+          description
+          passedAt = timestamp
+
+    -- | The authority records that the shipment has failed the checkpoint.
+    -- This action archives the pending `Checkpoint` and creates a `CheckpointFailed`
+    -- contract to document the failure and its reason.
+    choice Fail : ContractId CheckpointFailed
+      with
+        reason: Text -- ^ The documented reason for the failure.
+      controller authority
+      do
+        timestamp <- getTime
+        create CheckpointFailed with
+          authority
+          custodian
+          shipmentCid
+          checkpointId
+          description
+          reason
+          failedAt = timestamp
+
+-- | An immutable record indicating that a shipment has successfully passed a checkpoint.
+-- This contract serves as a historical fact on the ledger.
+template CheckpointPassed
+  with
+    authority   : Party
+      -- ^ The party that approved the checkpoint.
+    custodian   : Party
+      -- ^ The party that held the shipment at the time of passing.
+    shipmentCid : ContractId Shipment
+      -- ^ The shipment that was checked.
+    checkpointId: Text
+      -- ^ The unique identifier of the checkpoint.
+    description : Text
+      -- ^ The description of the checkpoint that was passed.
+    passedAt    : Time
+      -- ^ The timestamp when the checkpoint was passed.
+  where
+    signatory authority
+    observer custodian
+
+    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
+    maintainer key._1
+
+-- | An immutable record indicating that a shipment has failed to pass a checkpoint.
+-- This contract serves as a historical fact on the ledger, capturing the reason for failure.
+template CheckpointFailed
+  with
+    authority   : Party
+      -- ^ The party that failed the shipment at the checkpoint.
+    custodian   : Party
+      -- ^ The party that held the shipment at the time of failure.
+    shipmentCid : ContractId Shipment
+      -- ^ The shipment that was checked.
+    checkpointId: Text
+      -- ^ The unique identifier of the checkpoint.
+    description : Text
+      -- ^ The description of the checkpoint that was failed.
+    reason      : Text
+      -- ^ The documented reason for the failure.
+    failedAt    : Time
+      -- ^ The timestamp when the checkpoint was failed.
+  where
+    signatory authority
+    observer custodian
+
+    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
+    maintainer key._1
