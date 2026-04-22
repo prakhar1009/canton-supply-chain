@@ -1,0 +1,144 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Asset where
+
+import DA.Date
+import DA.Next.Set (Set)
+import qualified DA.Next.Set as Set
+import DA.Text
+import DA.Time
+
+-- | Defines the static, immutable properties of a physical asset.
+-- These details are typically set at the time of manufacture and do not change.
+data AssetProperties = AssetProperties
+  with
+    sku : Text
+    -- ^ Stock Keeping Unit or model number.
+    description : Text
+    -- ^ A human-readable description of the asset.
+    manufactureDate : Date
+    -- ^ The date the asset was manufactured.
+  deriving (Eq, Show)
+
+-- | Represents a physical location, such as a warehouse, port, or retail store.
+data Location = Location
+  with
+    name : Text
+    -- ^ A descriptive name for the location (e.g., "Main Warehouse").
+    addressLine1 : Text
+    city : Text
+    country : Text
+    -- ^ Address details.
+  deriving (Eq, Show)
+
+-- | Represents a physical asset being tracked in the supply chain.
+-- The contract follows the lifecycle of the asset, with its state (e.g., custodian, location)
+-- being updated atomically through choices.
+template Asset
+  with
+    issuer : Party
+      -- ^ The party that created the asset record, typically the manufacturer.
+      -- The issuer remains a signatory throughout the asset's lifecycle to vouch for its provenance.
+    custodian : Party
+      -- ^ The party currently in physical possession of the asset. This is the primary field
+      -- that changes during a transfer of custody.
+    observers : Set Party
+      -- ^ A set of parties who can view the asset's state but not act on it (e.g., regulators).
+    properties : AssetProperties
+      -- ^ Immutable descriptive data about the asset.
+    currentLocation : Location
+      -- ^ The current physical location of the asset.
+    lastUpdated : Time
+      -- ^ Timestamp of the last state modification, providing an audit trail.
+    uniqueId : Text
+      -- ^ A globally unique identifier for this asset, e.g., a serial number or UUID. This is
+      -- used in the contract key for stable, off-ledger referencing.
+  where
+    signatory issuer, custodian
+    observer observers
+
+    key (issuer, uniqueId) : (Party, Text)
+    maintainer key._1
+
+    -- | The current custodian proposes to transfer the asset to a new party.
+    -- This initiates a two-phase commit process for the handover, ensuring both parties agree.
+    choice ProposeTransfer : ContractId TransferProposal
+      controller custodian
+      with
+        newCustodian : Party
+          -- ^ The party to whom custody is being offered.
+      do
+        assertMsg "Cannot transfer asset to the current custodian" (newCustodian /= custodian)
+        create TransferProposal with
+          assetCid = self
+          proposer = custodian
+          newCustodian
+          assetData = this
+
+    -- | The current custodian updates the physical location of the asset.
+    -- This is a single-party action as it doesn't change custody.
+    choice UpdateLocation : ContractId Asset
+      controller custodian
+      with
+        newLocation : Location
+          -- ^ The new location of the asset.
+        updateTime : Time
+          -- ^ The time of the location update.
+      do
+        assertMsg "New location must be different from the current location" (newLocation /= currentLocation)
+        create this with
+          currentLocation = newLocation
+          lastUpdated = updateTime
+
+    -- | The issuer can grant viewing permission to a new party at any time.
+    choice AddObserver : ContractId Asset
+      controller issuer
+      with
+        newObserver : Party
+      do
+        assertMsg "Party is already an observer" (not $ Set.member newObserver observers)
+        create this with observers = Set.insert newObserver observers
+
+
+-- | A proposal to transfer an Asset from a `proposer` (the current custodian)
+-- to a `newCustodian`. This contract must be accepted by the `newCustodian` to
+-- complete the transfer.
+template TransferProposal
+  with
+    assetCid : ContractId Asset
+      -- ^ The contract ID of the asset being transferred.
+    proposer : Party
+      -- ^ The party proposing the transfer (the asset's current custodian).
+    newCustodian : Party
+      -- ^ The party who must accept the transfer to take custody.
+    assetData : Asset
+      -- ^ A snapshot of the asset data at the time of proposal, for transparency.
+  where
+    signatory proposer, newCustodian
+
+    -- | The `newCustodian` accepts the transfer, atomically updating the Asset contract's
+    -- custodian field. This completes the handover.
+    choice AcceptTransfer : ContractId Asset
+      controller newCustodian
+      with
+        acceptTime : Time
+      do
+        -- Fetch the original asset to ensure it hasn't been modified (e.g., transferred
+        -- to someone else) since this proposal was created.
+        originalAsset <- fetch assetCid
+        assertMsg "The proposer is no longer the custodian of the asset"
+          (originalAsset.custodian == proposer)
+
+        -- Atomically archive the old asset contract and create a new one with the updated custodian.
+        archive assetCid
+        create originalAsset with
+          custodian = newCustodian
+          lastUpdated = acceptTime
+
+    -- | Either the proposer or the new custodian can reject or cancel the transfer proposal.
+    -- This archives the proposal, leaving the original Asset contract untouched.
+    choice RejectTransfer : ()
+      controller proposer, newCustodian
+      do
+        return ()
