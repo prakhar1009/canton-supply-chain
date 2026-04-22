@@ -1,0 +1,157 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module CustodyTransfer where
+
+import Daml.Script
+import Asset (Asset)
+
+-- | Represents a pending proposal to transfer custody of an asset from one party to another.
+-- This follows the standard proposal-accept pattern to ensure bilateral agreement for the handover.
+-- The successful acceptance of this proposal results in an atomic update of the underlying
+-- `Asset` contract's custodian field.
+template TransferProposal
+  with
+    assetCid : ContractId Asset         -- ^ The contract ID of the asset being transferred.
+    fromCustodian : Party              -- ^ The current custodian offering the transfer.
+    toCustodian : Party                -- ^ The party who will receive custody upon acceptance.
+  where
+    signatory fromCustodian
+    observer toCustodian
+
+    ensure fromCustodian /= toCustodian
+
+    -- | The `toCustodian` accepts the transfer of the asset.
+    -- This choice archives the proposal and atomically updates the custodian on the `Asset` contract,
+    -- creating a new version of the asset and adding the `fromCustodian` to its history.
+    choice Accept : ContractId Asset
+      controller toCustodian
+      do
+        -- Fetch the asset contract using the provided contract ID.
+        -- This ensures the asset is still active and its state is consistent with the proposal.
+        asset <- fetch assetCid
+
+        -- Verify that the proposer is indeed the current custodian of the asset.
+        assertMsg "Proposer is not the current custodian of the asset."
+          (asset.custodian == fromCustodian)
+
+        -- Atomically exercise the Transfer choice on the Asset contract to update its custodian.
+        -- This archives the old asset and creates a new one with the updated custodian,
+        -- all within the same transaction as archiving this proposal.
+        exercise assetCid Asset.Transfer with newCustodian = toCustodian
+
+    -- | The `toCustodian` rejects the transfer proposal.
+    -- This simply archives the proposal, leaving the asset unchanged.
+    choice Reject : ()
+      controller toCustodian
+      do
+        -- No further action is needed. The proposal is archived, and the transaction concludes.
+        return ()
+
+    -- | The `fromCustodian` withdraws the transfer proposal before it has been accepted or rejected.
+    -- This is useful if the transfer is no longer desired or was made in error.
+    choice Withdraw : ()
+      controller fromCustodian
+      do
+        -- No further action is needed. The proposal is archived.
+        return ()
+
+-- | A helper function, callable from a script or another choice, to initiate a custody transfer.
+-- This creates a `TransferProposal` contract on the ledger.
+proposeTransfer : Party -> Party -> ContractId Asset -> Update (ContractId TransferProposal)
+proposeTransfer from to cid = create TransferProposal with
+  assetCid = cid
+  fromCustodian = from
+  toCustodian = to
+
+-- === Scenarios for testing and demonstration ===
+-- This script demonstrates the full lifecycle of a custody transfer, including a successful
+-- multi-hop transfer and a rejected transfer.
+setup_custody_transfer_scenario : Script ()
+setup_custody_transfer_scenario = script do
+  -- 1. Allocate parties representing different actors in the supply chain.
+  manufacturer <- allocatePartyWithHint "Manufacturer" (PartyIdHint "manufacturer")
+  logistics <- allocatePartyWithHint "LogisticsCo" (PartyIdHint "logisticsco")
+  retailer <- allocatePartyWithHint "Retailer" (PartyIdHint "retailer")
+
+  -- 2. Manufacturer creates an asset, initially in their own custody.
+  let assetId = "ASSET-SN-12345"
+  let assetDesc = "Batch of 1000 Premium Widgets"
+
+  assetCid <- submit manufacturer do
+    createCmd Asset.Asset with
+      manufacturer
+      owner = manufacturer -- Assuming manufacturer owns it initially
+      custodian = manufacturer
+      description = assetDesc
+      id = assetId
+      previousCustodians = []
+
+  debug $ "Initial asset created: " <> show assetCid
+
+  -- 3. Manufacturer proposes to transfer custody to the Logistics company.
+  proposalCid <- submit manufacturer do
+    proposeTransfer manufacturer logistics assetCid
+
+  debug $ "Transfer proposed from Manufacturer to Logistics: " <> show proposalCid
+
+  -- 4. Logistics company accepts the transfer.
+  -- This should archive the proposal and update the asset's custodian in one atomic transaction.
+  updatedAssetCid <- submit logistics do
+    exerciseCmd proposalCid Accept
+
+  debug $ "Logistics accepted transfer. New asset CID: " <> show updatedAssetCid
+
+  -- 5. Verify the asset now has the Logistics company as the custodian and the manufacturer
+  -- has been added to the history.
+  updatedAsset <- queryContractId logistics updatedAssetCid
+  assert (updatedAsset.custodian == logistics)
+  assert (updatedAsset.previousCustodians == [manufacturer])
+  debug "Verification successful: Asset is now in custody of Logistics."
+
+  -- 6. Logistics company proposes to transfer custody to the Retailer.
+  proposalToRetailerCid <- submit logistics do
+    proposeTransfer logistics retailer updatedAssetCid
+
+  debug $ "Transfer proposed from Logistics to Retailer: " <> show proposalToRetailerCid
+
+  -- 7. Retailer accepts the transfer, completing the primary supply chain journey.
+  finalAssetCid <- submit retailer do
+    exerciseCmd proposalToRetailerCid Accept
+
+  debug $ "Retailer accepted transfer. Final asset CID: " <> show finalAssetCid
+
+  -- 8. Verify the final state of the asset.
+  finalAsset <- queryContractId retailer finalAssetCid
+  assert (finalAsset.custodian == retailer)
+  assert (finalAsset.previousCustodians == [logistics, manufacturer])
+  debug "Verification successful: Asset is now in custody of Retailer."
+
+  -- === Test Rejection Scenario ===
+  -- Create a second asset to demonstrate a rejected transfer.
+  let assetId2 = "ASSET-SN-67890"
+  assetCid2 <- submit manufacturer do
+    createCmd Asset.Asset with
+      manufacturer
+      owner = manufacturer
+      custodian = manufacturer
+      description = "Asset for rejection test"
+      id = assetId2
+      previousCustodians = []
+
+  -- Propose a transfer that will be rejected.
+  rejectionProposalCid <- submit manufacturer do
+    proposeTransfer manufacturer logistics assetCid2
+
+  -- Logistics company rejects the proposal.
+  submit logistics do
+    exerciseCmd rejectionProposalCid Reject
+
+  debug "Logistics rejected the transfer proposal."
+
+  -- Check that the asset's custodian has not changed.
+  asset2 <- queryContractId manufacturer assetCid2
+  assert(asset2.custodian == manufacturer)
+  debug ("Rejection test passed. Asset custodian remains unchanged: " <> show asset2.custodian)
+
+  return ()
