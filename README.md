@@ -1,48 +1,45 @@
 # Canton Supply Chain Provenance
 
-This project provides a robust, production-ready implementation of a supply chain provenance and tracking system using Daml smart contracts, running on the Canton network. It models the lifecycle of physical assets from manufacturing to retail, ensuring an immutable and auditable trail of custody.
+A demonstration project showcasing how to build a multi-party supply chain tracking application on the Canton Network using Daml smart contracts. This example provides a framework for end-to-end supply chain visibility, creating an immutable and auditable history of an asset's journey from manufacturer to retailer.
 
-The core principle is to represent each physical asset as a digital contract on a distributed ledger. Transfers of custody are modeled as atomic, multi-party workflows, guaranteeing that ownership changes are consistent and agreed upon by all relevant parties. Canton's privacy model ensures that sensitive commercial details are only shared on a need-to-know basis among the involved stakeholders.
+## Overview
 
-## Features
+In modern supply chains, trust and transparency are paramount. This project models the lifecycle of a physical good as a digital asset on a distributed ledger. Canton's privacy-by-design architecture ensures that sensitive commercial data (like pricing or schedules) is only shared with the parties who have a contractual right to see it.
 
--   **End-to-End Provenance:** Creates a verifiable, immutable history for every asset in the supply chain.
--   **Atomic Handovers:** Guarantees that the transfer of custody is an all-or-nothing operation, preventing errors and disputes.
--   **Role-Based Permissions:** Clearly defined roles (Manufacturer, Logistics, Customs, Retailer) with specific rights and obligations.
--   **Real-time Visibility:** All authorized stakeholders have a shared, consistent, and real-time view of the asset's status and location.
--   **Privacy by Design:** Leverages Canton's underlying privacy model to ensure that transaction details are only visible to the signatories and observers of a given contract.
--   **Extensible Model:** The Daml model can be easily extended to include more complex workflows, such as quality assurance checks, financing, and regulatory approvals.
+### Key Features
 
-## Core Workflow
-
-The system models the journey of a physical good through a typical supply chain:
-
-1.  **Manufacturing:** The `Manufacturer` creates a digital representation of a physical asset on the ledger. This `Asset` contract contains key details like serial number, product type, and manufacturing date.
-2.  **Logistics Handover:** The `Manufacturer` proposes a transfer to a `Logistics` provider. The provider reviews the proposal and accepts, atomically creating a new `Asset` contract under their custody and archiving the old one.
-3.  **Customs Clearance:** The `Logistics` provider presents the asset to `Customs` for inspection. A `Customs` agent can inspect the asset and attest to its clearance, adding a verifiable claim to the asset's data.
-4.  **Retailer Delivery:** Once cleared, the `Logistics` provider initiates the final handover to the `Retailer`. The `Retailer` accepts delivery, taking final custody of the asset.
-
-Each step in this process is a Daml choice that can only be exercised by the authorized party, creating a cryptographically secure audit trail.
+-   **Digital Asset Representation**: Physical goods are tokenized as Daml `Asset` contracts, containing details like ID, description, origin, and current custodian.
+-   **Atomic Handovers**: Custody transfers between parties (e.g., Manufacturer to Logistics) are executed as atomic transactions using a proposal/acceptance pattern, preventing loss, disputes, or duplication.
+-   **Immutable Audit Trail**: Every significant event—creation, shipment, customs clearance, delivery—is cryptographically recorded on the ledger, providing a single source of truth for all participants.
+-   **Role-Based Permissions**: Daml's rights and obligations system ensures that only authorized parties can perform specific actions on an asset (e.g., only the current custodian can initiate a transfer).
+-   **Selective Data Disclosure**: Canton's privacy model means a logistics provider might see shipping details, but not the manufacturer's cost, even if both are stakeholders on the same asset contract.
 
 ## Technology Stack
 
--   **Smart Contract Language:** [Daml](https://daml.com/)
--   **Underlying Ledger:** [Canton](https://www.canton.io/)
--   **Build & Package Manager:** [DPM (Digital Asset Package Manager)](https://docs.digitalasset.com/dpm/index.html)
--   **SDK Version:** `3.4.0`
+-   **Smart Contracts**: [Daml](https://www.daml.com/)
+-   **Ledger**: [Canton Network](https://www.canton.io/) (via `dpm sandbox` for local development)
+-   **Build Tool**: [DPM (Digital Asset Package Manager)](https://docs.digitalasset.com/dpm/index.html)
+-   **Frontend**: TypeScript, React, [@c7/react](https://docs.digitalasset.com/app-dev/bindings-ts/index.html)
+-   **Ledger API**: Canton JSON API
 
 ## Project Structure
 
 ```
 .
 ├── daml/                      # Daml smart contract source code
-│   ├── Daml/Asset.daml        # Core Asset template
-│   ├── Daml/Roles.daml        # Party role contracts
-│   └── Daml/Transfer.daml     # Transfer proposal workflow
-├── test/                      # Daml Script tests
-│   └── Test/Main.daml
-├── .gitignore
-├── daml.yaml                  # Daml package configuration
+│   ├── SupplyChain/
+│   │   ├── Asset.daml         # Core template for the tracked asset and transfer proposals
+│   │   └── Roles.daml         # Role contracts for Manufacturer, Logistics, etc.
+│   ├── daml.yaml              # Daml package configuration
+│   └── test/
+│       └── SupplyChainTest.daml # Daml Script tests for the core workflows
+├── frontend/                  # React-based web UI
+│   ├── src/
+│   │   ├── TrackingMap.tsx    # Component to visualize asset location
+│   │   └── trackingService.ts # Service to interact with the JSON API
+│   └── package.json           # Frontend dependencies
+├── scripts/
+│   └── seed-data.sh           # Script to initialize the ledger with test parties and data
 └── README.md                  # This file
 ```
 
@@ -50,52 +47,75 @@ Each step in this process is a Daml choice that can only be exercised by the aut
 
 ### Prerequisites
 
--   [DPM (Digital Asset Package Manager)](https://docs.digitalasset.com/dpm/index.html) version compatible with SDK `3.4.0`.
+-   [DPM (SDK 3.4.0 or later)](https://docs.digitalasset.com/dpm/install.html)
+-   [Node.js](https://nodejs.org/) (v18 or later)
+-   `jq` (for the JSON processing in the seed script)
 
-You can install DPM with the following command:
-```bash
-curl https://get.digitalasset.com/install/install.sh | sh
-```
-
-### Build and Test
+### Installation & Setup
 
 1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/your-org/canton-supply-chain.git
+    ```sh
+    git clone https://github.com/digital-asset/canton-supply-chain.git
     cd canton-supply-chain
     ```
 
-2.  **Build the Daml model:**
-    This command compiles the Daml code into a DAR (Daml Archive) file, which is the deployable unit.
-    ```bash
-    dpm build
-    ```
-    The output will be located at `.daml/dist/canton-supply-chain-0.1.0.dar`.
-
-3.  **Run the tests:**
-    This command executes the Daml Script tests defined in the `test/` directory to verify the contract logic.
-    ```bash
-    dpm test
+2.  **Install frontend dependencies:**
+    ```sh
+    cd frontend
+    npm install
+    cd ..
     ```
 
-### Run Locally with Canton Sandbox
+### Running the Application
 
-1.  **Start the Canton sandbox:**
-    This command starts a local Canton ledger, which includes a JSON API endpoint for application integration.
-    ```bash
+Follow these steps in separate terminal windows.
+
+1.  **Start the Canton Sandbox Ledger:**
+    This command starts a local Canton ledger and exposes the JSON API on port `7575`.
+    ```sh
     dpm sandbox
     ```
-    The sandbox exposes two key services:
-    -   **Ledger gRPC API:** `localhost:6866`
-    -   **HTTP JSON API:** `localhost:7575` (useful for web UIs and integrations)
 
-2.  **(Optional) Upload the DAR:**
-    The `dpm sandbox` command typically uploads the project DAR automatically. If you need to do it manually (e.g., for a running sandbox), you can use the `dpm ledger upload-dar` command.
-
-3.  **(Optional) Run setup script:**
-    You can use Daml Script to initialize the ledger with parties and initial contracts.
-    ```bash
-    dpm script --dar .daml/dist/canton-supply-chain-0.1.0.dar \
-      --script-name Test.Main:setup \
-      --ledger-host localhost --ledger-port 6866
+2.  **Build and Deploy the Daml Models:**
+    This compiles the Daml code into a `.dar` archive and uploads it to the running sandbox. `dpm build` automatically detects the running sandbox and deploys to it.
+    ```sh
+    dpm build
     ```
+
+3.  **Seed the Ledger with Test Data:**
+    This script allocates the necessary parties (Manufacturer, LogisticsCo, Customs, Retailer) and creates an initial `Asset` contract on the ledger.
+    ```sh
+    ./scripts/seed-data.sh
+    ```
+    The script will output JWTs and Party IDs for each role. You will need these to log into the frontend application.
+
+4.  **Run the Frontend Application:**
+    Navigate to the frontend directory and start the development server.
+    ```sh
+    cd frontend
+    npm start
+    ```
+    The application will be available at `http://localhost:3000`. You can log in using the party IDs and tokens generated by the seed script.
+
+### Running Tests
+
+To run the Daml Script tests and verify the contract logic end-to-end:
+```sh
+dpm test
+```
+
+## Core Workflows
+
+1.  **Asset Creation**: The `Manufacturer` party creates a new `Asset` contract, recording its unique ID, description, and origin. The `Manufacturer` is the initial custodian.
+
+2.  **Request Pickup**: The `Manufacturer` exercises the `RequestPickup` choice, designating a `Logistics` party to take custody. This creates a `TransferProposal` contract, viewable by both parties.
+
+3.  **Accept Handover**: The `Logistics` party sees the proposal and exercises the `AcceptHandover` choice. This choice atomically archives the proposal and the old `Asset` contract, and creates a new `Asset` contract with the `Logistics` party as the new custodian. The chain of custody is preserved.
+
+4.  **Customs Clearance**: When the asset reaches a border, the `Logistics` party proposes a handover to the `Customs` authority. The `Customs` party accepts, inspects, and then exercises a `ClearCustoms` choice, which can hand it back to the same or a different `Logistics` party for the next leg of the journey.
+
+5.  **Final Delivery**: The `Logistics` party delivers the asset to the `Retailer`, following the same robust proposal/acceptance handover pattern. The final `Asset` contract shows the `Retailer` as the custodian, with the full, unbroken chain of custody visible to all authorized stakeholders in the contract's history.
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
