@@ -6,11 +6,5 @@ dependencies:
   - daml-prim
   - daml-stdlib
   - daml-script
-parties:
-  - Manufacturer
-  - LogisticsProvider
-  - CustomsAuthority
-  - Retailer
-  - Consumer
 build-options:
-  - --target=2.0
+  - --target=3.1
