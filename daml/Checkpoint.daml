@@ -4,107 +4,121 @@
 module Checkpoint where
 
 import DA.Time (Time)
-import Shipment (Shipment)
+import Asset (Asset, Details)
 
--- | Represents a pending checkpoint, quality gate, or customs inspection that a shipment
--- must clear. This contract is created by the authority overseeing the checkpoint and
--- observed by the current custodian of the shipment.
+-- | Represents the possible outcomes of a checkpoint inspection.
+data CheckpointOutcome
+  = Passed
+  | Failed with
+      reason : Text
+  deriving (Eq, Show)
+
+-- | Represents a mandatory checkpoint or inspection gate in a supply chain,
+-- | such as a customs clearance, quality assurance check, or security scan.
+-- | This contract is created by an `authority` and must be actioned by an
+-- | `operator` when an asset, held by `assetCustodian`, reaches the checkpoint.
 template Checkpoint
   with
-    authority   : Party
-      -- ^ The party responsible for clearing the checkpoint (e.g., customs, quality control).
-    custodian   : Party
-      -- ^ The party currently in custody of the shipment.
-    shipmentCid : ContractId Shipment
-      -- ^ The shipment contract this checkpoint pertains to.
-    checkpointId: Text
-      -- ^ A unique identifier for this type of checkpoint (e.g., "CUSTOMS_CLEARANCE_LAX").
-    description : Text
-      -- ^ A human-readable description of the checkpoint's purpose.
+    authority      : Party
+      -- ^ The party that mandates the checkpoint (e.g., customs agency, QA department).
+    operator       : Party
+      -- ^ The party authorized to perform the inspection and record the outcome.
+    location       : Text
+      -- ^ A description of the physical location of the checkpoint (e.g., "Port of Singapore, Terminal 4").
+    checkpointType : Text
+      -- ^ The category of the checkpoint (e.g., "Customs", "QualityAssurance").
+    assetCid       : ContractId Asset
+      -- ^ The contract ID of the asset being inspected.
+    assetDetails   : Details
+      -- ^ Denormalized asset details for context, allowing observers of this
+      -- ^ contract to see asset information without needing visibility on the Asset contract itself.
+    assetCustodian : Party
+      -- ^ The party who currently possesses the asset and must present it for inspection.
   where
     signatory authority
-    observer custodian
+    observer operator, assetCustodian
 
-    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
+    key (authority, assetCid) : (Party, ContractId Asset)
     maintainer key._1
 
-    -- | The authority confirms the shipment has successfully passed the checkpoint.
-    -- This action archives the pending `Checkpoint` and creates a `CheckpointPassed`
-    -- contract as a permanent record of the event.
-    choice Pass : ContractId CheckpointPassed
-      controller authority
-      do
-        timestamp <- getTime
-        create CheckpointPassed with
-          authority
-          custodian
-          shipmentCid
-          checkpointId
-          description
-          passedAt = timestamp
-
-    -- | The authority records that the shipment has failed the checkpoint.
-    -- This action archives the pending `Checkpoint` and creates a `CheckpointFailed`
-    -- contract to document the failure and its reason.
-    choice Fail : ContractId CheckpointFailed
+    -- | Consuming choice for an `operator` to record that the asset has successfully
+    -- | passed the inspection. This archives the Checkpoint and creates a permanent
+    -- | `CheckpointRecord` as evidence.
+    choice RecordPass : ContractId CheckpointRecord
       with
-        reason: Text -- ^ The documented reason for the failure.
+        timestamp : Time
+          -- ^ The UTC time when the inspection was completed.
+        notes     : Text
+          -- ^ Optional notes from the operator regarding the inspection.
+      controller operator
+      do
+        -- Ensure the asset contract is still active and held by the expected custodian.
+        asset <- fetch assetCid
+        assertMsg "Asset custodian has changed since the checkpoint was issued."
+          (asset.currentCustodian == assetCustodian)
+
+        -- Create the historical record of the successful check.
+        create CheckpointRecord with
+          outcome = Passed
+          ..
+
+    -- | Consuming choice for an `operator` to record that the asset has failed
+    -- | the inspection. This archives the Checkpoint and creates a permanent
+    -- | `CheckpointRecord` detailing the failure.
+    choice RecordFail : ContractId CheckpointRecord
+      with
+        timestamp : Time
+          -- ^ The UTC time when the inspection was completed.
+        notes     : Text
+          -- ^ Optional notes from the operator regarding the inspection.
+        reason    : Text
+          -- ^ A mandatory, specific reason for the failure.
+      controller operator
+      do
+        -- Ensure the asset contract is still active and held by the expected custodian.
+        asset <- fetch assetCid
+        assertMsg "Asset custodian has changed since the checkpoint was issued."
+          (asset.currentCustodian == assetCustodian)
+
+        -- Create the historical record of the failed check.
+        create CheckpointRecord with
+          outcome = Failed with reason
+          ..
+
+    -- | Non-consuming choice for the `authority` to delegate the inspection task
+    -- | to a different operator.
+    choice DelegateOperator : ContractId Checkpoint
+      with
+        newOperator : Party
+          -- ^ The new party authorized to perform the inspection.
       controller authority
       do
-        timestamp <- getTime
-        create CheckpointFailed with
-          authority
-          custodian
-          shipmentCid
-          checkpointId
-          description
-          reason
-          failedAt = timestamp
+        assertMsg "New operator cannot be the same as the current operator." (newOperator /= operator)
+        create this with operator = newOperator
 
--- | An immutable record indicating that a shipment has successfully passed a checkpoint.
--- This contract serves as a historical fact on the ledger.
-template CheckpointPassed
+-- | An immutable historical record of a completed checkpoint inspection.
+-- | This contract serves as an audit trail entry, attesting to the outcome of
+-- | an inspection performed by an `operator` as mandated by an `authority`.
+template CheckpointRecord
   with
-    authority   : Party
-      -- ^ The party that approved the checkpoint.
-    custodian   : Party
-      -- ^ The party that held the shipment at the time of passing.
-    shipmentCid : ContractId Shipment
-      -- ^ The shipment that was checked.
-    checkpointId: Text
-      -- ^ The unique identifier of the checkpoint.
-    description : Text
-      -- ^ The description of the checkpoint that was passed.
-    passedAt    : Time
-      -- ^ The timestamp when the checkpoint was passed.
+    authority      : Party
+      -- ^ The party that mandated the checkpoint.
+    operator       : Party
+      -- ^ The party that performed the inspection.
+    location       : Text
+      -- ^ The location where the inspection took place.
+    checkpointType : Text
+      -- ^ The category of the checkpoint.
+    assetCid       : ContractId Asset
+      -- ^ The contract ID of the asset that was inspected.
+    assetDetails   : Details
+      -- ^ Denormalized asset details for historical context.
+    timestamp      : Time
+      -- ^ The UTC time when the inspection was completed.
+    notes          : Text
+      -- ^ Notes from the operator.
+    outcome        : CheckpointOutcome
+      -- ^ The result of the inspection (Passed or Failed).
   where
-    signatory authority
-    observer custodian
-
-    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
-    maintainer key._1
-
--- | An immutable record indicating that a shipment has failed to pass a checkpoint.
--- This contract serves as a historical fact on the ledger, capturing the reason for failure.
-template CheckpointFailed
-  with
-    authority   : Party
-      -- ^ The party that failed the shipment at the checkpoint.
-    custodian   : Party
-      -- ^ The party that held the shipment at the time of failure.
-    shipmentCid : ContractId Shipment
-      -- ^ The shipment that was checked.
-    checkpointId: Text
-      -- ^ The unique identifier of the checkpoint.
-    description : Text
-      -- ^ The description of the checkpoint that was failed.
-    reason      : Text
-      -- ^ The documented reason for the failure.
-    failedAt    : Time
-      -- ^ The timestamp when the checkpoint was failed.
-  where
-    signatory authority
-    observer custodian
-
-    key (authority, shipmentCid, checkpointId) : (Party, ContractId Shipment, Text)
-    maintainer key._1
+    signatory authority, operator
+    observer assetDetails.manufacturer
