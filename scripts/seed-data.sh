@@ -1,158 +1,198 @@
-#!/bin/bash
-#
-# Canton Supply Chain - Seeding Script
-#
-# This script populates a local Canton ledger (via the JSON API)
-# with a set of initial parties and contracts to represent a basic
-# supply chain scenario.
-#
-# Pre-requisites:
-#   - A running Canton sandbox on localhost:7575 (`dpm sandbox`)
-#   - `curl` and `jq` installed and available in your PATH.
-#
-
+#!/usr/bin/env bash
 set -euo pipefail
 
+# ==============================================================================
+# canton-supply-chain seed script
+#
+# Description:
+#   This script sets up the initial state for the supply chain demo by:
+#   1. Allocating parties (Manufacturer, Logistics, Customs, Retailer).
+#   2. Creating initial Asset contracts on the ledger.
+#   3. Generating a .env.local file for the frontend to use these parties.
+#
+# Usage:
+#   Ensure a Canton sandbox is running, then execute this script from the
+#   `scripts/` directory:
+#   ./seed-data.sh
+#
+# Requirements:
+#   - curl
+#   - jq
+#   - openssl (for JWT generation)
+# ==============================================================================
+
 # --- Configuration ---
-JSON_API_URL="http://localhost:7575"
-LEDGER_ID="sandbox"
-APP_ID="supply-chain-seeder"
-# Template IDs are specified as Module:Template
-TEMPLATE_ASSET="Asset:Asset"
-TEMPLATE_SHIPMENT="Shipment:Shipment"
+LEDGER_HOST=${LEDGER_HOST:-localhost}
+LEDGER_PORT=${LEDGER_PORT:-7575}
+LEDGER_URL="http://${LEDGER_HOST}:${LEDGER_PORT}"
+# The default secret used by `dpm sandbox`
+SECRET_KEY="secret"
+# Output file for frontend environment variables
+ENV_FILE="../frontend/.env.local"
+
 
 # --- Helper Functions ---
 
-# Check for required commands
-command -v curl >/dev/null 2>&1 || { echo >&2 "I require curl but it's not installed. Aborting."; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo >&2 "I require jq but it's not installed. Aborting."; exit 1; }
-
-# Function to encode a string in Base64 URL format
-b64url() {
-  base64 | tr '+/' '-_' | tr -d '='
+# Check for required command-line tools
+check_tools() {
+  for tool in curl jq openssl; do
+    if ! command -v $tool &> /dev/null; then
+      echo "Error: Required tool '$tool' is not installed. Please install it to continue." >&2
+      exit 1
+    fi
+  done
 }
 
-# Generates a JWT token for a given party.
-# NOTE: This is an insecure method suitable ONLY for sandbox/dev environments.
-generate_token() {
-  local party_id=$1
-  local header='{"alg":"HS256","typ":"JWT"}'
-  local payload="{\"ledgerId\":\"${LEDGER_ID}\",\"applicationId\":\"${APP_ID}\",\"actAs\":[\"${party_id}\"]}"
-  local b64_header=$(echo -n "${header}" | b64url)
-  local b64_payload=$(echo -n "${payload}" | b64url)
-  echo "${b64_header}.${b64_payload}."
+# Base64 URL encode for JWT
+base64_url_encode() {
+  echo -n "$1" | openssl base64 -e -A | tr '+/' '-_' | tr -d '='
 }
 
-# Allocates a new party on the ledger
+# Generate a JWT for a given list of parties.
+# If no parties are provided, an admin token (without actAs) is created.
+generate_jwt() {
+  local act_as=("$@")
+  local payload
+  if [ ${#act_as[@]} -eq 0 ]; then
+    # Admin token for party management
+    payload='{"ledgerId": "sandbox", "applicationId": "supply-chain-seeder"}'
+  else
+    # Party-specific token
+    local parties_json=$(printf '"%s",' "${act_as[@]}" | sed 's/,$//')
+    payload=$(printf '{"ledgerId": "sandbox", "applicationId": "supply-chain-seeder", "actAs": [%s]}' "$parties_json")
+  fi
+
+  local header='{"alg": "HS256", "typ": "JWT"}'
+  local encoded_header=$(base64_url_encode "$header")
+  local encoded_payload=$(base64_url_encode "$payload")
+  local signature_input="${encoded_header}.${encoded_payload}"
+  local signature=$(echo -n "${signature_input}" | openssl dgst -sha256 -hmac "${SECRET_KEY}" -binary | base64_url_encode)
+  echo "${signature_input}.${signature}"
+}
+
+# Allocate a party and return its full party ID string
 allocate_party() {
-  local display_name=$1
-  local payload="{\"displayName\": \"${display_name}\"}"
+  local hint=$1
+  local display_name=$2
+  local admin_token=$3
 
-  local response=$(curl -s -X POST \
-    "${JSON_API_URL}/v2/parties/allocate" \
+  echo "  -> Allocating party with hint '$hint' and display name '$display_name'..."
+  local response
+  response=$(curl -s -X POST \
+    -H "Authorization: Bearer ${admin_token}" \
     -H "Content-Type: application/json" \
-    -d "${payload}")
+    -d "{\"identifierHint\": \"${hint}\", \"displayName\": \"${display_name}\"}" \
+    "${LEDGER_URL}/v2/parties/allocate")
 
-  local party_id=$(echo "${response}" | jq -r '.identifier')
+  local party_id=$(echo "$response" | jq -r '.identifier')
   if [ -z "$party_id" ] || [ "$party_id" == "null" ]; then
-    echo >&2 "Failed to allocate party '${display_name}'. Response: ${response}"
+    echo "Error: Failed to allocate party '$hint'. Response: $response" >&2
     exit 1
   fi
-  echo "${party_id}"
+  echo "     - Allocated as: ${party_id}"
+  echo "$party_id"
 }
 
-# Creates a new contract
-create_contract() {
-  local token=$1
-  local template_id=$2
-  local payload_json=$3
-  local payload="{\"templateId\": \"${template_id}\", \"payload\": ${payload_json}}"
+# Create a new asset contract on the ledger
+create_asset() {
+  local manufacturer_token=$1
+  local asset_id=$2
+  local description=$3
+  local manufacturer_party=$4
+  local owner_party=$5
+  local logistics_party=$6
+  local customs_party=$7
+  local retailer_party=$8
 
-  local response=$(curl -s -X POST \
-    "${JSON_API_URL}/v1/create" \
-    -H "Authorization: Bearer ${token}" \
+  echo "  -> Creating asset '$asset_id'..."
+  local payload
+  payload=$(cat <<EOF
+{
+  "templateId": "SupplyChain.Asset:Asset",
+  "payload": {
+    "assetId": "${asset_id}",
+    "description": "${description}",
+    "manufacturer": "${manufacturer_party}",
+    "owner": "${owner_party}",
+    "observers": ["${logistics_party}", "${customs_party}", "${retailer_party}"]
+  }
+}
+EOF
+)
+
+  local response
+  response=$(curl -s -X POST \
+    -H "Authorization: Bearer ${manufacturer_token}" \
     -H "Content-Type: application/json" \
-    -d "${payload}")
+    -d "$payload" \
+    "${LEDGER_URL}/v1/create")
 
-  local contract_id=$(echo "${response}" | jq -r '.result.contractId')
+  local contract_id=$(echo "$response" | jq -r '.result.contractId')
   if [ -z "$contract_id" ] || [ "$contract_id" == "null" ]; then
-    echo >&2 "Failed to create contract '${template_id}'. Response: ${response}"
-    exit 1
+      echo "Error: Failed to create asset '$asset_id'. Is the sandbox running and the DAR loaded? Response: $response" >&2
+      exit 1
   fi
-  echo "${contract_id}"
+  echo "     - Created with Contract ID: ${contract_id}"
 }
 
-echo "--- Supply Chain Seeding Script ---"
-echo "Targeting JSON API at ${JSON_API_URL}"
+# --- Main Execution ---
 
-# 1. Allocate Parties
-echo
-echo "⚙️  Allocating parties..."
-MANUFACTURER=$(allocate_party "MegaCorp")
-CARRIER=$(allocate_party "SpeedyLogistics")
-CUSTOMS=$(allocate_party "GlobalCustoms")
-RETAILER=$(allocate_party "SuperRetail")
+main() {
+  check_tools
+  echo "🚀 Starting Supply Chain Data Seeding Script..."
+  echo "   Ledger URL: ${LEDGER_URL}"
 
-echo "  - Manufacturer: ${MANUFACTURER}"
-echo "  - Carrier:      ${CARRIER}"
-echo "  - Customs:      ${CUSTOMS}"
-echo "  - Retailer:     ${RETAILER}"
+  echo -e "\n(1/5) Generating Admin JWT for party allocation..."
+  local admin_token
+  admin_token=$(generate_jwt)
 
-# 2. Generate Auth Tokens
-MANUFACTURER_TOKEN=$(generate_token "${MANUFACTURER}")
+  echo -e "\n(2/5) Allocating all required parties..."
+  MANUFACTURER=$(allocate_party "Manufacturer" "Global Electronics Inc." "$admin_token")
+  LOGISTICS=$(allocate_party "Logistics" "SwiftShip Logistics" "$admin_token")
+  CUSTOMS=$(allocate_party "Customs" "National Customs Bureau" "$admin_token")
+  RETAILER=$(allocate_party "Retailer" "TechHaven Retail" "$admin_token")
 
-# 3. Create Assets
-echo
-echo "🏭 Creating initial assets as Manufacturer..."
-asset_cids=()
+  echo -e "\n(3/5) Generating Manufacturer's JWT for asset creation..."
+  local manufacturer_token
+  manufacturer_token=$(generate_jwt "$MANUFACTURER")
 
-# Asset 1: Laptops
-payload_asset1=$(jq -n \
-  --arg manufacturer "$MANUFACTURER" \
-  --arg owner "$MANUFACTURER" \
-  --arg assetId "LAP-2024-001" \
-  --arg description "Box of 100 high-end laptops" \
-  --argjson observers "[\"$CARRIER\", \"$CUSTOMS\", \"$RETAILER\"]" \
-  '{manufacturer: $manufacturer, owner: $owner, assetId: $assetId, description: $description, observers: $observers}')
-cid1=$(create_contract "${MANUFACTURER_TOKEN}" "${TEMPLATE_ASSET}" "${payload_asset1}")
-asset_cids+=("${cid1}")
-echo "  - Created Asset 'LAP-2024-001' with contractId ${cid1}"
+  echo -e "\n(4/5) Creating initial assets owned by the manufacturer..."
+  create_asset "$manufacturer_token" \
+    "LAPTOP-SN-12345" \
+    "15-inch Pro Laptop, Silver, 16GB RAM, 512GB SSD" \
+    "$MANUFACTURER" "$MANUFACTURER" "$LOGISTICS" "$CUSTOMS" "$RETAILER"
 
-# Asset 2: Monitors
-payload_asset2=$(jq -n \
-  --arg manufacturer "$MANUFACTURER" \
-  --arg owner "$MANUFACTURER" \
-  --arg assetId "MON-2024-042" \
-  --arg description "Pallet of 50 4K monitors" \
-  --argjson observers "[\"$CARRIER\", \"$CUSTOMS\", \"$RETAILER\"]" \
-  '{manufacturer: $manufacturer, owner: $owner, assetId: $assetId, description: $description, observers: $observers}')
-cid2=$(create_contract "${MANUFACTURER_TOKEN}" "${TEMPLATE_ASSET}" "${payload_asset2}")
-asset_cids+=("${cid2}")
-echo "  - Created Asset 'MON-2024-042' with contractId ${cid2}"
+  create_asset "$manufacturer_token" \
+    "PHONE-SN-98765" \
+    "6.7-inch Smartphone, Midnight Black, 256GB" \
+    "$MANUFACTURER" "$MANUFACTURER" "$LOGISTICS" "$CUSTOMS" "$RETAILER"
 
-# 4. Create a Shipment to bundle the assets
-echo
-echo "🚚 Creating a shipment to bundle assets..."
+  create_asset "$manufacturer_token" \
+    "TABLET-SN-55501" \
+    "11-inch Tablet, Space Gray, Wi-Fi + Cellular, 128GB" \
+    "$MANUFACTURER" "$MANUFACTURER" "$LOGISTICS" "$CUSTOMS" "$RETAILER"
 
-# Build the JSON array of contract IDs
-asset_cids_json=$(printf '%s\n' "${asset_cids[@]}" | jq -R . | jq -s .)
+  echo -e "\n(5/5) Creating frontend environment file at ${ENV_FILE}..."
+  rm -f "$ENV_FILE"
+  cat > "$ENV_FILE" << EOF
+# This file is auto-generated by scripts/seed-data.sh
+# Do not edit manually.
 
-payload_shipment=$(jq -n \
-  --arg shipper "$MANUFACTURER" \
-  --arg carrier "$CARRIER" \
-  --arg destParty "$RETAILER" \
-  --arg source "MegaCorp Warehouse A" \
-  --arg destination "SuperRetail Distribution Center" \
-  --argjson assetCids "$asset_cids_json" \
-  '{shipper: $shipper, carrier: $carrier, destinationParty: $destParty, source: $source, destination: $destination, assetCids: $assetCids}')
+REACT_APP_LEDGER_URL=${LEDGER_URL}
+REACT_APP_MANUFACTURER_PARTY=${MANUFACTURER}
+REACT_APP_LOGISTICS_PARTY=${LOGISTICS}
+REACT_APP_CUSTOMS_PARTY=${CUSTOMS}
+REACT_APP_RETAILER_PARTY=${RETAILER}
+EOF
+  echo "   - Wrote configuration to ${ENV_FILE}"
 
-shipment_cid=$(create_contract "${MANUFACTURER_TOKEN}" "${TEMPLATE_SHIPMENT}" "${payload_shipment}")
-echo "  - Created Shipment with contractId ${shipment_cid}"
+  echo -e "\n✅ Seeding complete!"
+  echo "Parties created:"
+  echo "  - Manufacturer: ${MANUFACTURER}"
+  echo "  - Logistics:    ${LOGISTICS}"
+  echo "  - Customs:      ${CUSTOMS}"
+  echo "  - Retailer:     ${RETAILER}"
+}
 
-echo
-echo "✅ Seeding complete!"
-echo "   You can now interact with these parties and contracts using the UI or API."
-echo "   Manufacturer Party ID: ${MANUFACTURER}"
-echo "   Carrier Party ID:      ${CARRIER}"
-echo "   Retailer Party ID:     ${RETAILER}"
-echo
+# Run the main function
+main
