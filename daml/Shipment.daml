@@ -1,185 +1,101 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module Shipment where
 
-import DA.Set (Set)
-import qualified DA.Set as Set
 import DA.Time (Time)
-import Asset (Asset)
 
--- | Represents a physical location for origin or destination.
-data Location = Location with
-  city: Text
-  country: Text
-  address: Optional Text
+-- | Represents a single temperature reading for cold-chain compliance.
+data TemperatureReading = TemperatureReading with
+  timestamp         : Time
+    -- ^ The time the reading was taken. This is set to the ledger effective time.
+  temperatureCelsius : Decimal
+    -- ^ The temperature in degrees Celsius.
   deriving (Eq, Show)
 
--- | Represents the lifecycle status of a shipment, dictating which actions are permitted.
-data ShipmentStatus
-  = InPreparation   -- ^ Shipment is being prepared by the manufacturer.
-  | AwaitingPickup  -- ^ Shipment is ready for the carrier to pick up.
-  | InTransit       -- ^ Shipment is with the carrier and on its way.
-  | AwaitingCustoms -- ^ Shipment has arrived at customs and is pending clearance.
-  | ClearedCustoms  -- ^ Shipment has cleared customs and is ready for the final delivery leg.
-  deriving (Eq, Show)
-
--- | Details about the mode and method of transport.
-data TransportDetails = TransportDetails with
-  mode: Text            -- ^ e.g., "Sea", "Air", "Road"
-  vesselName: Optional Text
-  flightNumber: Optional Text
-  trackingId: Text
-  deriving (Eq, Show)
-
--- | A proposal from a manufacturer to a carrier to handle a shipment.
--- This follows the standard Daml proposal-accept pattern to create a two-party agreement.
-template ShipmentProposal
-  with
-    manufacturer: Party
-    carrier: Party
-    receiver: Party
-    customs: Optional Party
-    observers: Set Party
-    shipmentId: Text
-    description: Text
-    assets: [ContractId Asset]
-    origin: Location
-    destination: Location
-    proposalTime: Time
-  where
-    signatory manufacturer
-    observer carrier
-
-    choice Accept : ContractId Shipment
-      -- | The carrier accepts the proposal, creating the official `Shipment` contract.
-      controller carrier
-      do
-        create Shipment with
-          manufacturer
-          carrier
-          receiver
-          customs
-          observers
-          shipmentId
-          description
-          assets
-          origin
-          destination
-          status = InPreparation
-          lastUpdated = proposalTime
-          transportDetails = None
-
-    choice Withdraw : ()
-      -- | The manufacturer withdraws the proposal before it's accepted.
-      controller manufacturer
-      do archive self
-
--- | The main shipment contract, representing an agreement between a manufacturer and a carrier
--- to transport a set of assets to a receiver.
+-- | Represents a physical shipment in transit from a manufacturer to a receiver,
+-- | via one or more carriers. This is the primary active state for a shipment.
 template Shipment
   with
-    shipmentId: Text
-    description: Text
     manufacturer: Party
+      -- ^ The party that created the goods.
     carrier: Party
+      -- ^ The party currently responsible for transporting the shipment.
     receiver: Party
-    customs: Optional Party
-    observers: Set Party
-    assets: [ContractId Asset]
-    origin: Location
-    destination: Location
-    status: ShipmentStatus
-    lastUpdated: Time
-    transportDetails: Optional TransportDetails
+      -- ^ The final recipient of the shipment.
+    description: Text
+      -- ^ A human-readable description of the shipment contents.
+    sku: Text
+      -- ^ The unique Stock Keeping Unit identifier for the product.
+    quantity: Int
+      -- ^ The number of units in the shipment.
+    temperatureReadings: [TemperatureReading]
+      -- ^ A log of temperature readings taken during transit. Newest readings are at the front of the list.
   where
     signatory manufacturer, carrier
-    observer (Set.toList observers) ++ [receiver] ++ (case customs of Some c -> [c] | None -> [])
+    observer receiver
 
-    key (manufacturer, shipmentId) : (Party, Text)
+    key (manufacturer, sku) : (Party, Text)
     maintainer key._1
 
-    choice Cancel : ()
-      -- | The manufacturer can cancel the shipment before it has been picked up by the carrier.
-      controller manufacturer
-      do
-        assertMsg "Shipment can only be cancelled before it is in transit" $
-          status `elem` [InPreparation, AwaitingPickup]
-        archive self
-
-    choice MarkReadyForPickup : ContractId Shipment
-      -- | The manufacturer signals that the shipment is packaged and ready for carrier pickup.
-      controller manufacturer
-      do
-        assertMsg "Shipment must be in 'InPreparation' status" $ status == InPreparation
-        now <- getTime
-        create this with
-          status = AwaitingPickup
-          lastUpdated = now
-
-    choice Pickup : ContractId Shipment
-      -- | The carrier confirms pickup of the shipment from the manufacturer.
+    -- | The current carrier can log a new temperature reading. This is crucial for
+    -- | cold-chain logistics to prove compliance with temperature requirements.
+    choice LogTemperature : ContractId Shipment
       with
-        pickupTime: Time
-        initialTransportDetails: TransportDetails
+        newTemperatureCelsius: Decimal
+          -- ^ The temperature reading in degrees Celsius.
       controller carrier
       do
-        assertMsg "Shipment must be 'AwaitingPickup'" $ status == AwaitingPickup
+        now <- getTime
+        let newReading = TemperatureReading with
+              timestamp = now
+              temperatureCelsius = newTemperatureCelsius
+        -- Prepend the new reading to the list and create an updated contract.
         create this with
-          status = InTransit
-          lastUpdated = pickupTime
-          transportDetails = Some initialTransportDetails
+          temperatureReadings = newReading :: temperatureReadings
 
-    choice ArriveAtCustoms : ContractId Shipment
-      -- | The carrier records the shipment's arrival at a customs checkpoint.
-      -- This is only applicable if a customs authority is part of the workflow.
+    -- | The current carrier can transfer responsibility for the shipment to a new carrier.
+    -- | This creates a new `Shipment` contract with the new carrier as a signatory,
+    -- | preserving the audit trail.
+    choice Transfer : ContractId Shipment
+      with
+        newCarrier: Party
+          -- ^ The party taking over custody of the shipment.
       controller carrier
       do
-        assertMsg "Shipment must be 'InTransit'" $ status == InTransit
-        assertMsg "No customs authority specified for this shipment" $ isSome customs
-        now <- getTime
-        create this with
-          status = AwaitingCustoms
-          lastUpdated = now
+        -- Ensure a party doesn't transfer the shipment to themselves.
+        assertMsg "New carrier cannot be the same as the current carrier." (newCarrier /= carrier)
+        create this with carrier = newCarrier
 
-    choice ClearCustoms : ContractId Shipment
-      -- | The designated customs authority confirms the shipment has cleared inspection.
-      controller case customs of Some c -> [c] | None -> []
-      do
-        assertMsg "Shipment must be 'AwaitingCustoms'" $ status == AwaitingCustoms
-        now <- getTime
-        create this with
-          status = ClearedCustoms
-          lastUpdated = now
-
-    choice BeginFinalDelivery : ContractId Shipment
-      -- | The carrier marks the shipment as having left the customs/port facility
-      -- and is now on the final leg of its journey.
-      controller carrier
-      do
-        assertMsg "Shipment must have 'ClearedCustoms' status" $ status == ClearedCustoms
-        now <- getTime
-        create this with
-          status = InTransit
-          lastUpdated = now
-
-    choice ConfirmDelivery : ()
-      -- | The receiver confirms that the shipment has been received. This completes the
-      -- logistic part of the workflow and archives the shipment tracking contract.
-      -- Note: This does not handle the transfer of title for the assets themselves,
-      -- which should be handled by choices on the `Asset` contracts.
+    -- | The receiver can accept the delivery of the shipment, moving it to a
+    -- | 'DeliveredShipment' state and finalizing the audit trail.
+    choice AcceptDelivery : ContractId DeliveredShipment
       controller receiver
       do
-        assertMsg "Shipment must be 'InTransit' or 'ClearedCustoms' to be delivered" $
-          status `elem` [InTransit, ClearedCustoms]
-        archive self
-
-    nonconsuming choice UpdateTransportDetails : ContractId Shipment
-      -- | The carrier can update tracking information while the shipment is in transit.
-      -- This is non-consuming because it's a status update, not a state transition.
-      with
-        newTransportDetails: TransportDetails
-      controller carrier
-      do
-        assertMsg "Can only update details while in transit" $ status == InTransit
         now <- getTime
-        create this with
-          transportDetails = Some newTransportDetails
-          lastUpdated = now
+        create DeliveredShipment with
+          deliveryTime = now
+          ..
+
+-- | Represents a shipment that has been successfully delivered to its final destination.
+-- | This contract serves as a permanent, auditable record of the completed delivery,
+-- | including the final temperature log.
+template DeliveredShipment
+  with
+    manufacturer: Party
+    carrier: Party
+      -- ^ The final carrier who delivered the shipment.
+    receiver: Party
+    description: Text
+    sku: Text
+    quantity: Int
+    deliveryTime: Time
+      -- ^ The timestamp when the delivery was accepted by the receiver.
+    temperatureReadings: [TemperatureReading]
+      -- ^ The final, complete log of temperature readings for the shipment's journey.
+  where
+    signatory manufacturer, receiver
+    observer carrier
+
+    key (manufacturer, sku) : (Party, Text)
+    maintainer key._1
