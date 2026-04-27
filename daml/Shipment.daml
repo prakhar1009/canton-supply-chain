@@ -1,176 +1,185 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+module Shipment where
 
-module SupplyChain.Shipment where
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+import Asset (Asset)
 
-import DA.Time (Time, getTime)
-
--- | Represents a single temperature reading for cold-chain compliance.
-data TemperatureReading = TemperatureReading with
-  timestamp : Time    -- ^ The UTC timestamp of the reading.
-  celsius   : Decimal -- ^ The temperature in degrees Celsius.
-  observer  : Party   -- ^ The party (or IoT device representative) that took the reading.
+-- | Represents a physical location for origin or destination.
+data Location = Location with
+  city: Text
+  country: Text
+  address: Optional Text
   deriving (Eq, Show)
 
--- | Represents a shipment in transit. It tracks the asset, its current custodian
--- | (the logisticsProvider), and its temperature history for cold-chain products.
--- | The contract evolves as it is handed over between parties, and is terminated
--- | upon final delivery to the retailer.
+-- | Represents the lifecycle status of a shipment, dictating which actions are permitted.
+data ShipmentStatus
+  = InPreparation   -- ^ Shipment is being prepared by the manufacturer.
+  | AwaitingPickup  -- ^ Shipment is ready for the carrier to pick up.
+  | InTransit       -- ^ Shipment is with the carrier and on its way.
+  | AwaitingCustoms -- ^ Shipment has arrived at customs and is pending clearance.
+  | ClearedCustoms  -- ^ Shipment has cleared customs and is ready for the final delivery leg.
+  deriving (Eq, Show)
+
+-- | Details about the mode and method of transport.
+data TransportDetails = TransportDetails with
+  mode: Text            -- ^ e.g., "Sea", "Air", "Road"
+  vesselName: Optional Text
+  flightNumber: Optional Text
+  trackingId: Text
+  deriving (Eq, Show)
+
+-- | A proposal from a manufacturer to a carrier to handle a shipment.
+-- This follows the standard Daml proposal-accept pattern to create a two-party agreement.
+template ShipmentProposal
+  with
+    manufacturer: Party
+    carrier: Party
+    receiver: Party
+    customs: Optional Party
+    observers: Set Party
+    shipmentId: Text
+    description: Text
+    assets: [ContractId Asset]
+    origin: Location
+    destination: Location
+    proposalTime: Time
+  where
+    signatory manufacturer
+    observer carrier
+
+    choice Accept : ContractId Shipment
+      -- | The carrier accepts the proposal, creating the official `Shipment` contract.
+      controller carrier
+      do
+        create Shipment with
+          manufacturer
+          carrier
+          receiver
+          customs
+          observers
+          shipmentId
+          description
+          assets
+          origin
+          destination
+          status = InPreparation
+          lastUpdated = proposalTime
+          transportDetails = None
+
+    choice Withdraw : ()
+      -- | The manufacturer withdraws the proposal before it's accepted.
+      controller manufacturer
+      do archive self
+
+-- | The main shipment contract, representing an agreement between a manufacturer and a carrier
+-- to transport a set of assets to a receiver.
 template Shipment
   with
-    manufacturer      : Party   -- ^ The originator of the shipment.
-    logisticsProvider : Party   -- ^ The current party responsible for transport.
-    retailer          : Party   -- ^ The final destination of the shipment.
-    customs           : Party   -- ^ The customs authority for international shipments.
-    assetId           : Text    -- ^ A unique identifier for the physical asset.
-    description       : Text    -- ^ A description of the asset.
-    -- Cold-chain compliance fields
-    minTemp           : Decimal -- ^ The minimum required temperature in Celsius.
-    maxTemp           : Decimal -- ^ The maximum required temperature in Celsius.
-    temperatureLog    : [TemperatureReading] -- ^ A log of temperature readings.
+    shipmentId: Text
+    description: Text
+    manufacturer: Party
+    carrier: Party
+    receiver: Party
+    customs: Optional Party
+    observers: Set Party
+    assets: [ContractId Asset]
+    origin: Location
+    destination: Location
+    status: ShipmentStatus
+    lastUpdated: Time
+    transportDetails: Optional TransportDetails
   where
-    signatory manufacturer, logisticsProvider
-    observer retailer, customs
+    signatory manufacturer, carrier
+    observer (Set.toList observers) ++ [receiver] ++ (case customs of Some c -> [c] | None -> [])
 
-    key (manufacturer, assetId) : (Party, Text)
+    key (manufacturer, shipmentId) : (Party, Text)
     maintainer key._1
 
-    -- | Allows the current logistics provider to record a new temperature reading.
-    -- | Enforces that the reading is within the prescribed min/max range.
-    choice LogTemperature : ContractId Shipment
-      with
-        reading: TemperatureReading
-      controller logisticsProvider
+    choice Cancel : ()
+      -- | The manufacturer can cancel the shipment before it has been picked up by the carrier.
+      controller manufacturer
       do
-        -- Ensure the party recording the temperature is the current custodian.
-        assertMsg "Temperature must be recorded by the current logistics provider"
-          (reading.observer == logisticsProvider)
+        assertMsg "Shipment can only be cancelled before it is in transit" $
+          status `elem` [InPreparation, AwaitingPickup]
+        archive self
 
-        -- Validate the temperature reading against the shipment's requirements.
-        assertMsg ("Temperature " <> show reading.celsius <> "°C is outside the acceptable range of " <> show minTemp <> "°C to " <> show maxTemp <> "°C")
-          (reading.celsius >= minTemp && reading.celsius <= maxTemp)
-
-        -- Recreate the shipment with the new reading appended to the log.
-        create this with
-          temperatureLog = this.temperatureLog ++ [reading]
-
-    -- | The current logistics provider initiates a handover to a new provider.
-    -- | This creates a `HandoverProposal` that the new provider must accept.
-    choice OfferHandover : ContractId HandoverProposal
-      with
-        newLogisticsProvider : Party
-      controller logisticsProvider
+    choice MarkReadyForPickup : ContractId Shipment
+      -- | The manufacturer signals that the shipment is packaged and ready for carrier pickup.
+      controller manufacturer
       do
-        create HandoverProposal with
-          shipmentCid = self
-          currentLogisticsProvider = logisticsProvider
-          newLogisticsProvider
-          manufacturer
-          retailer
-          customs
-          assetId
-          description
-          minTemp
-          maxTemp
-          temperatureLog
-
-    -- | Allows the customs authority to record an inspection of the shipment.
-    -- | This serves as an immutable, auditable event in the shipment's history.
-    choice InspectByCustoms : ContractId Shipment
-      with
-        inspector : Party
-        notes : Text
-      controller customs
-      do
-        assertMsg "Inspector must be the designated customs authority" (inspector == customs)
-        -- In a real-world scenario, you might add inspection details to a log.
-        -- For this example, the choice acts as a simple auditable acknowledgment.
-        return self
-
-    -- | The retailer confirms receipt of the shipment, completing its journey.
-    -- | This archives the active `Shipment` contract and creates a final
-    -- | `DeliveredShipment` contract as a permanent record.
-    choice ConfirmDelivery : ContractId DeliveredShipment
-      controller retailer
-      do
+        assertMsg "Shipment must be in 'InPreparation' status" $ status == InPreparation
         now <- getTime
-        create DeliveredShipment with
-          deliveryTime = now
-          manufacturer
-          logisticsProvider
-          retailer
-          customs
-          assetId
-          description
-          minTemp
-          maxTemp
-          temperatureLog
+        create this with
+          status = AwaitingPickup
+          lastUpdated = now
 
--- | A proposal to transfer custody of a shipment from one logistics provider
--- | to another. This follows the standard proposal/acceptance pattern, ensuring
--- | that the transfer of responsibility is atomic and agreed upon by both parties.
-template HandoverProposal
-  with
-    shipmentCid              : ContractId Shipment
-    currentLogisticsProvider : Party
-    newLogisticsProvider     : Party
-    manufacturer             : Party
-    retailer                 : Party
-    customs                  : Party
-    assetId                  : Text
-    description              : Text
-    minTemp                  : Decimal
-    maxTemp                  : Decimal
-    temperatureLog           : [TemperatureReading]
-  where
-    signatory currentLogisticsProvider
-    observer newLogisticsProvider
-
-    -- | The prospective new logistics provider accepts custody. This archives the
-    -- | old `Shipment` contract and creates a new one with the updated custodian.
-    choice AcceptHandover : ContractId Shipment
-      controller newLogisticsProvider
+    choice Pickup : ContractId Shipment
+      -- | The carrier confirms pickup of the shipment from the manufacturer.
+      with
+        pickupTime: Time
+        initialTransportDetails: TransportDetails
+      controller carrier
       do
-        archive shipmentCid
-        create Shipment with
-          logisticsProvider = newLogisticsProvider
-          manufacturer
-          retailer
-          customs
-          assetId
-          description
-          minTemp
-          maxTemp
-          temperatureLog
+        assertMsg "Shipment must be 'AwaitingPickup'" $ status == AwaitingPickup
+        create this with
+          status = InTransit
+          lastUpdated = pickupTime
+          transportDetails = Some initialTransportDetails
 
-    -- | The prospective new logistics provider rejects the handover offer.
-    choice RejectHandover : ()
-      controller newLogisticsProvider
-      do return ()
+    choice ArriveAtCustoms : ContractId Shipment
+      -- | The carrier records the shipment's arrival at a customs checkpoint.
+      -- This is only applicable if a customs authority is part of the workflow.
+      controller carrier
+      do
+        assertMsg "Shipment must be 'InTransit'" $ status == InTransit
+        assertMsg "No customs authority specified for this shipment" $ isSome customs
+        now <- getTime
+        create this with
+          status = AwaitingCustoms
+          lastUpdated = now
 
-    -- | The current logistics provider withdraws the handover offer.
-    choice WithdrawHandover : ()
-      controller currentLogisticsProvider
-      do return ()
+    choice ClearCustoms : ContractId Shipment
+      -- | The designated customs authority confirms the shipment has cleared inspection.
+      controller case customs of Some c -> [c] | None -> []
+      do
+        assertMsg "Shipment must be 'AwaitingCustoms'" $ status == AwaitingCustoms
+        now <- getTime
+        create this with
+          status = ClearedCustoms
+          lastUpdated = now
 
--- | Represents a shipment that has been successfully delivered to the retailer.
--- | This is a terminal state contract, serving as a permanent historical record
--- | of the shipment's entire lifecycle, including its temperature log.
-template DeliveredShipment
-  with
-    manufacturer      : Party
-    logisticsProvider : Party
-    retailer          : Party
-    customs           : Party
-    assetId           : Text
-    description       : Text
-    minTemp           : Decimal
-    maxTemp           : Decimal
-    temperatureLog    : [TemperatureReading]
-    deliveryTime      : Time
-  where
-    signatory manufacturer, logisticsProvider, retailer
-    observer customs
+    choice BeginFinalDelivery : ContractId Shipment
+      -- | The carrier marks the shipment as having left the customs/port facility
+      -- and is now on the final leg of its journey.
+      controller carrier
+      do
+        assertMsg "Shipment must have 'ClearedCustoms' status" $ status == ClearedCustoms
+        now <- getTime
+        create this with
+          status = InTransit
+          lastUpdated = now
 
-    key (manufacturer, assetId) : (Party, Text)
-    maintainer key._1
+    choice ConfirmDelivery : ()
+      -- | The receiver confirms that the shipment has been received. This completes the
+      -- logistic part of the workflow and archives the shipment tracking contract.
+      -- Note: This does not handle the transfer of title for the assets themselves,
+      -- which should be handled by choices on the `Asset` contracts.
+      controller receiver
+      do
+        assertMsg "Shipment must be 'InTransit' or 'ClearedCustoms' to be delivered" $
+          status `elem` [InTransit, ClearedCustoms]
+        archive self
+
+    nonconsuming choice UpdateTransportDetails : ContractId Shipment
+      -- | The carrier can update tracking information while the shipment is in transit.
+      -- This is non-consuming because it's a status update, not a state transition.
+      with
+        newTransportDetails: TransportDetails
+      controller carrier
+      do
+        assertMsg "Can only update details while in transit" $ status == InTransit
+        now <- getTime
+        create this with
+          transportDetails = Some newTransportDetails
+          lastUpdated = now
