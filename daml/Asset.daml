@@ -1,144 +1,145 @@
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
+-- | This module defines the core `Asset` contract for the supply chain application.
+-- It represents a unique physical item and tracks its custody, status, and
+-- provenance as it moves through various parties.
+module SupplyChain.Asset where
 
-module Asset where
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time, getTime)
 
-import DA.Date
-import DA.Next.Set (Set)
-import qualified DA.Next.Set as Set
-import DA.Text
-import DA.Time
+-- | Represents the status of an asset in the supply chain.
+-- This algebraic data type allows for structured status updates, capturing
+-- relevant data for each stage.
+data AssetStatus
+  = Manufactured
+    -- ^ The asset has just been created by the manufacturer.
+  | InTransit with
+      shipper : Party
+      destination : Text
+    -- ^ The asset is currently being transported by a logistics provider.
+  | InCustoms with
+      port : Text
+    -- ^ The asset is undergoing customs clearance at a specific port.
+  | WithRetailer
+    -- ^ The asset has been received by the retailer.
+  | Delivered
+    -- ^ The asset has reached its final destination.
+  deriving (Eq, Show, Ord)
 
--- | Defines the static, immutable properties of a physical asset.
--- These details are typically set at the time of manufacture and do not change.
-data AssetProperties = AssetProperties
+-- | Records a single, immutable event in the asset's history.
+-- A list of these events forms the asset's complete, auditable provenance trail.
+data ProvenanceEvent = ProvenanceEvent
   with
-    sku : Text
-    -- ^ Stock Keeping Unit or model number.
-    description : Text
-    -- ^ A human-readable description of the asset.
-    manufactureDate : Date
-    -- ^ The date the asset was manufactured.
-  deriving (Eq, Show)
+    timestamp : Time
+      -- ^ The UTC time when the event occurred.
+    actor : Party
+      -- ^ The party who initiated the event (i.e., the controller of the choice).
+    from : Party
+      -- ^ The owner of the asset before the event.
+    to : Party
+      -- ^ The owner of the asset after the event. For status updates, `from` and `to` are the same.
+    location : Optional Text
+      -- ^ The physical location of the asset at the time of the event, if known.
+    status : AssetStatus
+      -- ^ The new status of the asset resulting from this event.
+  deriving (Eq, Show, Ord)
 
--- | Represents a physical location, such as a warehouse, port, or retail store.
-data Location = Location
-  with
-    name : Text
-    -- ^ A descriptive name for the location (e.g., "Main Warehouse").
-    addressLine1 : Text
-    city : Text
-    country : Text
-    -- ^ Address details.
-  deriving (Eq, Show)
 
--- | Represents a physical asset being tracked in the supply chain.
--- The contract follows the lifecycle of the asset, with its state (e.g., custodian, location)
--- being updated atomically through choices.
+-- | Represents a physical or digital asset being tracked in the supply chain.
+-- The contract is keyed on the manufacturer and a unique asset ID, preventing duplicates.
+-- Its state evolves by archiving the current contract and creating a new one with updated
+-- fields, preserving the full history in the `provenance` list.
 template Asset
   with
-    issuer : Party
-      -- ^ The party that created the asset record, typically the manufacturer.
-      -- The issuer remains a signatory throughout the asset's lifecycle to vouch for its provenance.
-    custodian : Party
-      -- ^ The party currently in physical possession of the asset. This is the primary field
-      -- that changes during a transfer of custody.
-    observers : Set Party
-      -- ^ A set of parties who can view the asset's state but not act on it (e.g., regulators).
-    properties : AssetProperties
-      -- ^ Immutable descriptive data about the asset.
-    currentLocation : Location
-      -- ^ The current physical location of the asset.
-    lastUpdated : Time
-      -- ^ Timestamp of the last state modification, providing an audit trail.
-    uniqueId : Text
-      -- ^ A globally unique identifier for this asset, e.g., a serial number or UUID. This is
-      -- used in the contract key for stable, off-ledger referencing.
+    assetId      : Text
+      -- ^ A unique identifier for the asset (e.g., serial number, SKU, lot number).
+    description  : Text
+      -- ^ A human-readable description of the asset.
+    manufacturer : Party
+      -- ^ The party that created the asset. This party is a constant throughout the asset's lifecycle.
+    owner        : Party
+      -- ^ The current custodian of the asset. This party has the authority to transfer or update it.
+    observers    : Set Party
+      -- ^ A set of parties who have read-only access to the asset's state.
+    status       : AssetStatus
+      -- ^ The current status of the asset in its lifecycle.
+    provenance   : [ProvenanceEvent]
+      -- ^ A chronologically ordered list of all events that have occurred, forming the audit trail.
   where
-    signatory issuer, custodian
-    observer observers
+    signatory manufacturer, owner
+    observer Set.toList observers
 
-    key (issuer, uniqueId) : (Party, Text)
+    key (manufacturer, assetId) : (Party, Text)
     maintainer key._1
 
-    -- | The current custodian proposes to transfer the asset to a new party.
-    -- This initiates a two-phase commit process for the handover, ensuring both parties agree.
-    choice ProposeTransfer : ContractId TransferProposal
-      controller custodian
+    -- | Transfers ownership of the asset to a new party. This is the primary
+    -- mechanism for moving the asset through the supply chain (e.g., from
+    -- manufacturer to shipper, or shipper to retailer).
+    nonconsuming choice Transfer : ContractId Asset
       with
-        newCustodian : Party
-          -- ^ The party to whom custody is being offered.
+        newOwner    : Party
+          -- ^ The party receiving custody of the asset.
+        newStatus   : AssetStatus
+          -- ^ The asset's status after the transfer (e.g., `InTransit`).
+        newLocation : Optional Text
+          -- ^ The location where the transfer is occurring.
+      controller owner
       do
-        assertMsg "Cannot transfer asset to the current custodian" (newCustodian /= custodian)
-        create TransferProposal with
-          assetCid = self
-          proposer = custodian
-          newCustodian
-          assetData = this
+        time <- getTime
+        let
+          event = ProvenanceEvent with
+            timestamp = time
+            actor     = owner
+            from      = owner
+            to        = newOwner
+            location  = newLocation
+            status    = newStatus
 
-    -- | The current custodian updates the physical location of the asset.
-    -- This is a single-party action as it doesn't change custody.
-    choice UpdateLocation : ContractId Asset
-      controller custodian
-      with
-        newLocation : Location
-          -- ^ The new location of the asset.
-        updateTime : Time
-          -- ^ The time of the location update.
-      do
-        assertMsg "New location must be different from the current location" (newLocation /= currentLocation)
+        -- The previous owner is automatically added as an observer to maintain
+        -- a chain of visibility.
+        let newObservers = Set.insert owner observers
+
         create this with
-          currentLocation = newLocation
-          lastUpdated = updateTime
+          owner      = newOwner
+          provenance = event :: provenance
+          status     = newStatus
+          observers  = newObservers
 
-    -- | The issuer can grant viewing permission to a new party at any time.
-    choice AddObserver : ContractId Asset
-      controller issuer
+    -- | Updates the status of the asset without changing its owner. This is used
+    -- for significant events that occur while the asset is in the custody of a
+    - single party (e.g., clearing customs, arriving at a warehouse).
+    nonconsuming choice UpdateStatus : ContractId Asset
+      with
+        newStatus   : AssetStatus
+          -- ^ The new status to apply to the asset.
+        newLocation : Optional Text
+          -- ^ The location of the asset when the status changed.
+      controller owner
+      do
+        time <- getTime
+        let
+          event = ProvenanceEvent with
+            timestamp = time
+            actor     = owner
+            from      = owner
+            to        = owner -- Ownership does not change
+            location  = newLocation
+            status    = newStatus
+        create this with
+          status     = newStatus
+          provenance = event :: provenance
+
+    -- | Adds a new party to the observer list, granting them read-only access
+    -- to the asset's state and history. This requires agreement from both the
+    -- original manufacturer and the current owner.
+    nonconsuming choice AddObserver : ContractId Asset
       with
         newObserver : Party
+          -- ^ The party to be granted observer rights.
+      controller manufacturer, owner
       do
-        assertMsg "Party is already an observer" (not $ Set.member newObserver observers)
+        let currentStakeholders = Set.insert owner (Set.insert manufacturer observers)
+        assertMsg "New observer is already a stakeholder on this asset" $
+          not $ Set.member newObserver currentStakeholders
+
         create this with observers = Set.insert newObserver observers
-
-
--- | A proposal to transfer an Asset from a `proposer` (the current custodian)
--- to a `newCustodian`. This contract must be accepted by the `newCustodian` to
--- complete the transfer.
-template TransferProposal
-  with
-    assetCid : ContractId Asset
-      -- ^ The contract ID of the asset being transferred.
-    proposer : Party
-      -- ^ The party proposing the transfer (the asset's current custodian).
-    newCustodian : Party
-      -- ^ The party who must accept the transfer to take custody.
-    assetData : Asset
-      -- ^ A snapshot of the asset data at the time of proposal, for transparency.
-  where
-    signatory proposer, newCustodian
-
-    -- | The `newCustodian` accepts the transfer, atomically updating the Asset contract's
-    -- custodian field. This completes the handover.
-    choice AcceptTransfer : ContractId Asset
-      controller newCustodian
-      with
-        acceptTime : Time
-      do
-        -- Fetch the original asset to ensure it hasn't been modified (e.g., transferred
-        -- to someone else) since this proposal was created.
-        originalAsset <- fetch assetCid
-        assertMsg "The proposer is no longer the custodian of the asset"
-          (originalAsset.custodian == proposer)
-
-        -- Atomically archive the old asset contract and create a new one with the updated custodian.
-        archive assetCid
-        create originalAsset with
-          custodian = newCustodian
-          lastUpdated = acceptTime
-
-    -- | Either the proposer or the new custodian can reject or cancel the transfer proposal.
-    -- This archives the proposal, leaving the original Asset contract untouched.
-    choice RejectTransfer : ()
-      controller proposer, newCustodian
-      do
-        return ()
