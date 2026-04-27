@@ -1,148 +1,131 @@
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-module SupplyChain.Test.SupplyChainTest where
+module SupplyChainTest where
 
 import Daml.Script
-import DA.Date as Date
-import DA.Time as Time
-import SupplyChain.Asset
-import SupplyChain.Shipment
-import SupplyChain.CustodyTransfer
-import SupplyChain.Checkpoint
+import Main -- Assumes the main supply chain templates are in a module named `Main`.
+import DA.Time (Time)
 
--- === Test Scenario ===
---
--- This script simulates a realistic, end-to-end supply chain workflow involving
--- four distinct parties: a Manufacturer, a Logistics provider, a Customs agency,
--- and a Retailer.
---
--- 1.  **Origination**: The Manufacturer creates a digital twin of a physical asset.
--- 2.  **Shipment Init**: The Manufacturer creates a Shipment contract, taking initial custody.
--- 3.  **Handover 1**: Manufacturer transfers custody to the Logistics provider.
--- 4.  **Checkpoint 1**: The Logistics provider records a "departed warehouse" checkpoint.
--- 5.  **Handover 2**: Logistics provider transfers custody to Customs for inspection.
--- 6.  **Checkpoint 2**: The Customs agency records a "customs cleared" checkpoint.
--- 7.  **Handover 3**: Customs transfers custody to the Retailer for final delivery.
--- 8.  **Delivery**: The Retailer marks the shipment as delivered, concluding the journey.
---
--- Each handover is a two-step proposal/acceptance process, ensuring atomic and
--- auditable transfers of responsibility.
-
-fullSupplyChainScenario : Script ()
-fullSupplyChainScenario = script do
-  -- 1. SETUP: Allocate parties for the scenario
+-- | A full end-to-end test of the supply chain lifecycle, from manufacturing to retail sale.
+-- This script simulates the interactions between a Manufacturer, Logistics provider,
+-- Customs authority, and a Retailer.
+supplyChainLifecycle : Script ()
+supplyChainLifecycle = script do
+  -- === 1. SETUP: ALLOCATE PARTIES ===
   manufacturer <- allocatePartyWithHint "Manufacturer" (PartyIdHint "manufacturer")
-  logisticsProvider <- allocatePartyWithHint "LogisticsCo" (PartyIdHint "logistics")
-  customsAgency <- allocatePartyWithHint "CustomsAgency" (PartyIdHint "customs")
+  logistics <- allocatePartyWithHint "LogisticsCo" (PartyIdHint "logistics")
+  customs <- allocatePartyWithHint "CustomsAuthority" (PartyIdHint "customs")
   retailer <- allocatePartyWithHint "Retailer" (PartyIdHint "retailer")
-  let allParties = [manufacturer, logisticsProvider, customsAgency, retailer]
 
-  debug $ "Parties allocated: " <> show allParties
+  let allObservers = [logistics, customs, retailer]
 
-  -- 2. ASSET CREATION: The Manufacturer creates the asset contract.
-  debug "Step 2: Manufacturer creates the asset..."
-  let assetId = "SN-987654"
+  debug "1. Parties allocated successfully."
+
+  -- === 2. CREATION: MANUFACTURER PRODUCES ASSET ===
+  let sku = "GPU-RTX-9090"
+  let description = "Next Generation AI-Enabled Graphics Processor"
+  initialTime <- getTime
+
   assetCid <- submit manufacturer do
     createCmd Asset with
-      manufacturer = manufacturer
-      assetId = assetId
-      description = "High-Value Electronics Component"
-      observers = [logisticsProvider, customsAgency, retailer]
+      sku
+      description
+      manufacturer
+      custodian = manufacturer
+      customs
+      observers = allObservers
+      state = Manufactured
+      lastUpdate = initialTime
+      history = ["Asset created by " <> show manufacturer]
 
-  debug $ "Asset " <> assetId <> " created with CID: " <> show assetCid
+  debug $ "2. Manufacturer created asset " <> sku <> ". CID: " <> show assetCid
 
-  -- 3. SHIPMENT CREATION: The Manufacturer initiates a shipment for the asset.
-  --    They are the initial custodian.
-  debug "Step 3: Manufacturer initiates the shipment..."
-  shipmentCid_M <- submit manufacturer do
-    createCmd Shipment with
-      assetCid = assetCid
-      currentCustodian = manufacturer
-      originalManufacturer = manufacturer
-      destination = retailer
-      isDelivered = False
-      observers = [logisticsProvider, customsAgency] -- retailer is already destination
+  -- === 3. HANDOVER: MANUFACTURER TO LOGISTICS ===
+  debug "3. Manufacturer proposing transfer to Logistics provider."
+  proposalCid <- submit manufacturer do
+    exerciseCmd assetCid ProposeTransfer with newCustodian = logistics
 
-  debug $ "Initial shipment created with custodian " <> show manufacturer
+  debug $ "   -> Transfer proposal created. CID: " <> show proposalCid
 
-  -- 4. HANDOVER 1: Manufacturer -> Logistics Provider
-  debug "Step 4: Manufacturer transfers custody to Logistics Provider..."
+  debug "   -> Logistics provider accepting the transfer."
+  assetCid_L1 <- submit logistics do
+    exerciseCmd proposalCid AcceptTransfer
 
-  -- Manufacturer proposes the transfer
-  proposalCid_M_L <- submit manufacturer do
-    exerciseCmd shipmentCid_M ProposeCustodyTransfer with newCustodian = logisticsProvider
+  debug $ "   -> Transfer accepted. New asset CID: " <> show assetCid_L1
 
-  -- Logistics provider accepts the transfer
-  (shipmentCid_L, _) <- submit logisticsProvider do
-    exerciseCmd proposalCid_M_L Accept
+  -- Verify state after transfer
+  (asset_L1, _) <- fetchCid assetCid_L1
+  assert (asset_L1.custodian == logistics)
+  assert (asset_L1.state == InTransit)
+  debug "   -> Verified: Asset is now with Logistics and InTransit."
 
-  debug $ "Custody successfully transferred to " <> show logisticsProvider
+  -- === 4. IN-TRANSIT UPDATE: ARRIVAL AT PORT ===
+  debug "4. Logistics provider updating asset state to AwaitingCustoms."
+  assetCid_L2 <- submit logistics do
+    exerciseCmd assetCid_L1 UpdateState with
+      newState = AwaitingCustoms
+      logEntry = "Arrived at destination port. Awaiting customs clearance."
 
-  -- 5. CHECKPOINT 1: Logistics Provider records a checkpoint.
-  debug "Step 5: Logistics Provider records a departure checkpoint..."
-  now <- getTime
-  _ <- submit logisticsProvider do
-    exerciseCmd shipmentCid_L RecordCheckpoint with
-      location = "Central Distribution Hub"
-      notes = Some "Shipment departed warehouse facility."
-      timestamp = now
+  -- Verify state change
+  (asset_L2, _) <- fetchCid assetCid_L2
+  assert (asset_L2.state == AwaitingCustoms)
+  debug "   -> Verified: Asset state is AwaitingCustoms."
 
-  debug "Logistics checkpoint recorded."
+  -- === 5. CUSTOMS CLEARANCE ===
+  debug "5. Customs Authority clearing the asset for transit."
+  assetCid_L3 <- submitMulti [customs, logistics] do
+    exerciseCmd assetCid_L2 ClearForTransit
 
-  -- 6. HANDOVER 2: Logistics Provider -> Customs Agency
-  debug "Step 6: Logistics Provider transfers custody to Customs Agency..."
+  -- Verify state change
+  (asset_L3, _) <- fetchCid assetCid_L3
+  assert (asset_L3.state == ClearedCustoms)
+  debug "   -> Verified: Asset state is ClearedCustoms."
 
-  -- Logistics provider proposes the transfer
-  proposalCid_L_C <- submit logisticsProvider do
-    exerciseCmd shipmentCid_L ProposeCustodyTransfer with newCustodian = customsAgency
+  -- === 6. HANDOVER: LOGISTICS TO RETAILER ===
+  debug "6. Logistics provider proposing transfer to Retailer."
+  proposalCid2 <- submit logistics do
+    exerciseCmd assetCid_L3 ProposeTransfer with newCustodian = retailer
 
-  -- Customs agency accepts the transfer
-  (shipmentCid_C, _) <- submit customsAgency do
-    exerciseCmd proposalCid_L_C Accept
+  debug $ "   -> Transfer proposal created. CID: " <> show proposalCid2
 
-  debug $ "Custody successfully transferred to " <> show customsAgency
+  debug "   -> Retailer accepting the transfer."
+  assetCid_R1 <- submit retailer do
+    exerciseCmd proposalCid2 AcceptTransfer
 
-  -- 7. CHECKPOINT 2: Customs Agency records a clearance checkpoint.
-  debug "Step 7: Customs Agency records a clearance checkpoint..."
-  now2 <- getTime
-  _ <- submit customsAgency do
-    exerciseCmd shipmentCid_C RecordCheckpoint with
-      location = "Port of Entry - Customs Zone"
-      notes = Some "Inspection complete. Cleared for import."
-      timestamp = now2
+  debug $ "   -> Transfer to retailer accepted. New asset CID: " <> show assetCid_R1
 
-  debug "Customs checkpoint recorded."
+  -- Verify state after transfer
+  (asset_R1, _) <- fetchCid assetCid_R1
+  assert (asset_R1.custodian == retailer)
+  assert (asset_R1.state == InTransit)
+  debug "   -> Verified: Asset is now with Retailer."
 
-  -- 8. HANDOVER 3: Customs Agency -> Retailer
-  debug "Step 8: Customs Agency transfers custody to Retailer for final delivery..."
+  -- === 7. RETAIL OPS: RECEIVE INTO STOCK ===
+  debug "7. Retailer updating asset state to InStock."
+  assetCid_R2 <- submit retailer do
+    exerciseCmd assetCid_R1 UpdateState with
+      newState = InStock
+      logEntry = "Asset scanned and received into store inventory."
 
-  -- Customs agency proposes the transfer
-  proposalCid_C_R <- submit customsAgency do
-    exerciseCmd shipmentCid_C ProposeCustodyTransfer with newCustodian = retailer
+  -- Verify state change
+  (asset_R2, _) <- fetchCid assetCid_R2
+  assert (asset_R2.state == InStock)
+  debug "   -> Verified: Asset is now InStock."
 
-  -- Retailer accepts the transfer
-  (shipmentCid_R, _) <- submit retailer do
-    exerciseCmd proposalCid_C_R Accept
+  -- === 8. SALE: RETAILER SELLS ASSET ===
+  debug "8. Retailer marking asset as sold, concluding its tracked lifecycle."
+  submit retailer do
+    exerciseCmd assetCid_R2 MarkAsSold
 
-  debug $ "Custody successfully transferred to final destination: " <> show retailer
+  -- Verify archival by confirming the contract can no longer be fetched.
+  fetchCid assetCid_R2 `shouldFail` do
+    pure ()
+  debug "   -> Verified: Asset contract has been archived."
 
-  -- 9. DELIVERY: Retailer marks the shipment as delivered.
-  debug "Step 9: Retailer marks the shipment as delivered..."
-  deliveredShipmentCid <- submit retailer do
-    exerciseCmd shipmentCid_R MarkDelivered
+  debug "SUCCESS: Full supply chain lifecycle test completed."
 
-  debug "Shipment has been marked as delivered."
 
-  -- 10. VERIFICATION: Check the final state of the delivered shipment.
-  deliveredShipment <- fetch deliveredShipmentCid
-  assertMsg "Final custodian should be the retailer" (deliveredShipment.currentCustodian == retailer)
-  assertMsg "Shipment should be marked as delivered" (deliveredShipment.isDelivered)
-
-  -- Query for all checkpoints to verify the audit trail
-  checkpoints <- query @Checkpoint manufacturer
-  debug $ "Found " <> show (length checkpoints) <> " checkpoints on the ledger."
-  assertMsg "There should be two checkpoints in total" (length checkpoints == 2)
-
-  debug "SUCCESS: Full supply chain scenario completed and verified."
-  return ()
+-- | Main test suite entry point for `dpm test`.
+tests = script do
+  supplyChainLifecycle
